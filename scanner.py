@@ -18,6 +18,7 @@ from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import requests
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 warnings.filterwarnings("ignore")
@@ -31,6 +32,19 @@ OUT_FILE = "data.json"
 # ===============================
 n500 = pd.read_csv("https://archives.nseindia.com/content/indices/ind_nifty500list.csv")
 sector_map = dict(zip(n500["Symbol"], n500["Industry"]))
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+fno_set = set()
+try:
+    _r = requests.get("https://archives.nseindia.com/content/fo/fo_mktlots.csv",
+                      headers=HEADERS, timeout=30)
+    if _r.ok:
+        for _line in _r.text.splitlines()[1:]:
+            _p = [x.strip() for x in _line.split(",")]
+            if len(_p) >= 2 and _p[1]:
+                fno_set.add(_p[1])
+except Exception:
+    pass
 base_symbols = n500["Symbol"].astype(str).str.strip().tolist()
 symbols = [s + ".NS" for s in base_symbols]
 print(f"Universe: {len(symbols)} symbols")
@@ -131,10 +145,48 @@ def split_live(df, bar_minutes):
     return df, None
 
 
+def session_vwap(today5):
+    """Cumulative session VWAP from today's 5m bars."""
+    if today5 is None or today5.empty:
+        return None
+    d = today5.dropna(subset=["High", "Low", "Close", "Volume"])
+    if d.empty or d["Volume"].sum() == 0:
+        return None
+    tp = (d["High"] + d["Low"] + d["Close"]) / 3
+    return r2((tp * d["Volume"]).sum() / d["Volume"].sum())
+
+
+def hhmm(ts, bar_minutes=5):
+    t = ts.tz_localize(IST) if ts.tzinfo is None else ts.tz_convert(IST)
+    t = t + timedelta(minutes=bar_minutes)  # signal confirms at bar close
+    return t.strftime("%H:%M")
+
+
+def cross_times(today5, up_levels, dn_levels):
+    """First 5m close above each up level / below each dn level today."""
+    out = {k: None for k in list(up_levels) + list(dn_levels)}
+    if today5 is None or today5.empty:
+        return out
+    for ts, bar in today5.iterrows():
+        c = bar.get("Close")
+        if c is None or pd.isna(c):
+            continue
+        t = None
+        for k, lv in up_levels.items():
+            if out[k] is None and lv is not None and c > lv:
+                t = t or hhmm(ts)
+                out[k] = t
+        for k, lv in dn_levels.items():
+            if out[k] is None and lv is not None and c < lv:
+                t = t or hhmm(ts)
+                out[k] = t
+    return out
+
+
 AGG = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
 
 
-def process_symbol(base, d1, h1, m30):
+def process_symbol(base, d1, h1, m30, m5):
     d1 = d1.dropna(subset=["Close"])
     if len(d1) < 30:
         return None
@@ -152,45 +204,73 @@ def process_symbol(base, d1, h1, m30):
         except Exception:
             h4 = h1.resample("4h").agg(AGG).dropna(subset=["Close"])
 
-    if m30 is not None and not m30.empty and "Close" in m30.columns:
-        m30 = m30.dropna(subset=["Close"])
-    else:
-        m30 = pd.DataFrame()
+    m30 = m30.dropna(subset=["Close"]) if (m30 is not None and not m30.empty and "Close" in m30.columns) else pd.DataFrame()
+    m5 = m5.dropna(subset=["Close"]) if (m5 is not None and not m5.empty and "Close" in m5.columns) else pd.DataFrame()
 
     # ---- completed histories for rectangles ----
     d_hist = (d1["Close"].iloc[:-1] if daily_is_live else d1["Close"]).tail(21)
-
     h4_comp, _ = split_live(h4, 240) if not h4.empty else (h4, None)
     m30_comp, _ = split_live(m30, 30) if not m30.empty else (m30, None)
+    m5_comp, _ = split_live(m5, 5) if not m5.empty else (m5, None)
 
     h4_hist = h4_comp["Close"].tail(13) if not h4_comp.empty else pd.Series(dtype=float)
     m30_hist = m30_comp["Close"].tail(8) if not m30_comp.empty else pd.Series(dtype=float)
+    m5_hist = m5_comp["Close"].tail(5) if not m5_comp.empty else pd.Series(dtype=float)
 
     d_max, d_min, d_w = rect(d_hist, 10)
     h4_max, h4_min, h4_w = rect(h4_hist, 6)
     m30_max, m30_min, m30_w = rect(m30_hist, 4)
+    m5_max, m5_min, m5_w = rect(m5_hist, 4)
 
-    # ---- previous completed candles (doji strategies) ----
+    # ---- previous completed candles ----
     pd_bar = d1.iloc[-2] if (daily_is_live and len(d1) >= 2) else d1.iloc[-1]
     p4_bar = h4_comp.iloc[-1] if not h4_comp.empty else None
     p30_bar = m30_comp.iloc[-1] if not m30_comp.empty else None
+    p5_bar = m5_comp.iloc[-1] if not m5_comp.empty else None
+
+    pdB = candle_block(pd_bar) if pd_bar is not None else None
+    p4B = candle_block(p4_bar) if p4_bar is not None else None
+    p30B = candle_block(p30_bar) if p30_bar is not None else None
+    p5B = candle_block(p5_bar) if p5_bar is not None else None
+
+    # ---- today's 5m bars: session VWAP + breakout times ----
+    today5 = pd.DataFrame()
+    if not m5.empty:
+        idx = m5.index
+        idx_ist = idx.tz_localize(IST) if idx.tz is None else idx.tz_convert(IST)
+        today5 = m5[idx_ist.date == now.date()]
+
+    bt = {}
+    for tf, mx, mn, cb in (("d", d_max, d_min, pdB), ("h4", h4_max, h4_min, p4B),
+                           ("m30", m30_max, m30_min, p30B), ("m5", m5_max, m5_min, p5B)):
+        up = {"u": mx}
+        dn = {"l": mn}
+        if cb is not None:
+            up["dh"] = cb["h"]
+            up["dc"] = cb["c"]
+        res = cross_times(today5, up, dn)
+        if any(v for v in res.values()):
+            bt[tf] = {k: v for k, v in res.items() if v}
 
     row = {
         "s": base,
         "sec": sector_map.get(base),
+        "fno": 1 if base in fno_set else 0,
         "ltp": r2(ltp),
         "dMax": d_max, "dMin": d_min, "dW": d_w,
         "h4Max": h4_max, "h4Min": h4_min, "h4W": h4_w,
         "m30Max": m30_max, "m30Min": m30_min, "m30W": m30_w,
-        "pd": candle_block(pd_bar) if pd_bar is not None else None,
-        "p4": candle_block(p4_bar) if p4_bar is not None else None,
-        "p30": candle_block(p30_bar) if p30_bar is not None else None,
+        "m5Max": m5_max, "m5Min": m5_min, "m5W": m5_w,
+        "pd": pdB, "p4": p4B, "p30": p30B, "p5": p5B,
+        "bt": bt or None,
         "rsiD": wilder_rsi(d1["Close"]),
         "rsi4": wilder_rsi(h4_comp["Close"]) if not h4_comp.empty else None,
         "rsi30": wilder_rsi(m30_comp["Close"]) if not m30_comp.empty else None,
+        "rsi5": wilder_rsi(m5_comp["Close"]) if not m5_comp.empty else None,
         "e9": ema_last(d1["Close"], 9),
         "e21": ema_last(d1["Close"], 21),
-        "vwap": calc_vwap(d1),
+        "e200": ema_last(d1["Close"], 200),
+        "vwap": session_vwap(today5) or calc_vwap(d1),
     }
 
     vol = d1["Volume"].dropna()
@@ -224,14 +304,15 @@ failed = 0
 
 for i in range(0, len(symbols), CHUNK):
     chunk = symbols[i:i + CHUNK]
-    d1_all = batch(chunk, period="6mo", interval="1d")
+    d1_all = batch(chunk, period="1y", interval="1d")
     h1_all = batch(chunk, period="60d", interval="1h")
     m30_all = batch(chunk, period="5d", interval="30m")
+    m5_all = batch(chunk, period="2d", interval="5m")
 
     for sym in chunk:
         base = sym.replace(".NS", "")
         try:
-            row = process_symbol(base, pick(d1_all, sym), pick(h1_all, sym), pick(m30_all, sym))
+            row = process_symbol(base, pick(d1_all, sym), pick(h1_all, sym), pick(m30_all, sym), pick(m5_all, sym))
             if row:
                 rows.append(row)
             else:
