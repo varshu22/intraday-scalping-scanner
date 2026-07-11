@@ -238,7 +238,8 @@ def process_symbol(base, d1, h1, m30, m5):
     if not m5.empty:
         idx = m5.index
         idx_ist = idx.tz_localize(IST) if idx.tz is None else idx.tz_convert(IST)
-        today5 = m5[idx_ist.date == now.date()]
+        last_day = max(idx_ist.date)          # last trading day (works on weekends/holidays)
+        today5 = m5[idx_ist.date == last_day]
 
     bt = {}
     for tf, mx, mn, cb in (("d", d_max, d_min, pdB), ("h4", h4_max, h4_min, p4B),
