@@ -1,0 +1,40 @@
+name: Update scanner data
+
+on:
+  workflow_dispatch:            # cron-job.org hits this — the reliable trigger
+  schedule:                     # backup only; GitHub cron often lags 10-40 min
+    - cron: "*/30 4-9 * * 1-5"  # ~09:30-15:30 IST window
+    - cron: "15 10 * * 1-5"     # 15:45 IST end-of-day snapshot
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scanner
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        run: python scanner.py
+
+      - name: Commit data.json
+        run: |
+          git config user.name "scanner-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git pull --rebase
+          git add data.json
+          git diff --cached --quiet || git commit -m "data: $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
