@@ -35,16 +35,21 @@ sector_map = dict(zip(n500["Symbol"], n500["Industry"]))
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 fno_set = set()
-try:
-    _r = requests.get("https://archives.nseindia.com/content/fo/fo_mktlots.csv",
-                      headers=HEADERS, timeout=30)
-    if _r.ok:
-        for _line in _r.text.splitlines()[1:]:
-            _p = [x.strip() for x in _line.split(",")]
-            if len(_p) >= 2 and _p[1]:
-                fno_set.add(_p[1])
-except Exception:
-    pass
+for _url in ("https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv",
+             "https://archives.nseindia.com/content/fo/fo_mktlots.csv"):
+    try:
+        _r = requests.get(_url, headers=HEADERS, timeout=30)
+        if _r.ok and len(_r.text) > 200:
+            for _line in _r.text.splitlines()[1:]:
+                _p = [x.strip() for x in _line.split(",")]
+                if len(_p) >= 2 and _p[1] and _p[1].upper() == _p[1] and " " not in _p[1]:
+                    fno_set.add(_p[1])
+            if fno_set:
+                break
+    except Exception:
+        continue
+if not fno_set:
+    print("WARNING: F&O list fetch failed from all sources — fno flags will be 0")
 base_symbols = n500["Symbol"].astype(str).str.strip().tolist()
 symbols = [s + ".NS" for s in base_symbols]
 print(f"Universe: {len(symbols)} symbols")
@@ -186,6 +191,10 @@ def cross_times(today5, up_levels, dn_levels):
 AGG = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
 
 
+def ema_block(closes):
+    return {"e9": ema_last(closes, 9), "e21": ema_last(closes, 21), "e200": ema_last(closes, 200)}
+
+
 def process_symbol(base, d1, h1, m30, m5):
     d1 = d1.dropna(subset=["Close"])
     if len(d1) < 30:
@@ -249,6 +258,7 @@ def process_symbol(base, d1, h1, m30, m5):
         if cb is not None:
             up["dh"] = cb["h"]
             up["dc"] = cb["c"]
+            dn["dl"] = cb["l"]
         res = cross_times(today5, up, dn)
         if any(v for v in res.values()):
             bt[tf] = {k: v for k, v in res.items() if v}
@@ -271,6 +281,12 @@ def process_symbol(base, d1, h1, m30, m5):
         "e9": ema_last(d1["Close"], 9),
         "e21": ema_last(d1["Close"], 21),
         "e200": ema_last(d1["Close"], 200),
+        "ema": {
+            "d": ema_block(d1["Close"]),
+            "h4": ema_block(h4_comp["Close"]) if not h4_comp.empty else None,
+            "m30": ema_block(m30_comp["Close"]) if not m30_comp.empty else None,
+            "m5": ema_block(m5_comp["Close"]) if not m5_comp.empty else None,
+        },
         "vwap": session_vwap(today5) or calc_vwap(d1),
     }
 
@@ -307,8 +323,8 @@ for i in range(0, len(symbols), CHUNK):
     chunk = symbols[i:i + CHUNK]
     d1_all = batch(chunk, period="1y", interval="1d")
     h1_all = batch(chunk, period="60d", interval="1h")
-    m30_all = batch(chunk, period="5d", interval="30m")
-    m5_all = batch(chunk, period="2d", interval="5m")
+    m30_all = batch(chunk, period="1mo", interval="30m")
+    m5_all = batch(chunk, period="5d", interval="5m")
 
     for sym in chunk:
         base = sym.replace(".NS", "")
